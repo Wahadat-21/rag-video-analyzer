@@ -1,0 +1,499 @@
+"""
+Video RAG Prototype
+Requirements:
+
+pip install tensorflow opencv-python numpy pillow
+
+Usage:
+
+python video_rag.py video.mp4
+
+Then type queries such as:
+
+car
+person
+road
+animal
+building
+"""
+
+import os
+import cv2
+import sys
+import json
+import numpy as np
+import tensorflow as tf
+
+from PIL import Image
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+
+FRAME_INTERVAL = 30
+TOP_K = 5
+EMBEDDING_DIM = 1280
+
+# ==========================================================
+# FEATURE EXTRACTOR
+# ==========================================================
+
+base_model = tf.keras.applications.MobileNetV2(
+    weights="imagenet",
+    include_top=False,
+    pooling="avg"
+)
+
+def preprocess_frame(frame):
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    frame = cv2.resize(
+        frame,
+        (224, 224)
+    )
+
+    frame = tf.keras.applications.mobilenet_v2.preprocess_input(
+        frame.astype(np.float32)
+    )
+
+    return np.expand_dims(frame, axis=0)
+
+def extract_embedding(frame):
+    x = preprocess_frame(frame)
+
+    embedding = base_model.predict(
+        x,
+        verbose=0
+    )
+
+    embedding = embedding.flatten()
+
+    norm = np.linalg.norm(embedding)
+
+    if norm > 0:
+        embedding = embedding / norm
+
+    return embedding
+
+# ==========================================================
+# VIDEO PROCESSING
+# ==========================================================
+
+def extract_frames(video_path):
+
+    cap = cv2.VideoCapture(video_path)
+
+    frames = []
+
+    frame_ids = []
+
+    idx = 0
+
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            break
+
+        if idx % FRAME_INTERVAL == 0:
+
+            frames.append(frame)
+
+            frame_ids.append(idx)
+
+        idx += 1
+
+    cap.release()
+
+    return frames, frame_ids
+
+# ==========================================================
+# VECTOR DATABASE
+# ==========================================================
+
+class VectorStore:
+
+    def __init__(self):
+
+        self.embeddings = []
+
+        self.metadata = []
+
+    def add(self, embedding, meta):
+
+        self.embeddings.append(embedding)
+
+        self.metadata.append(meta)
+
+    def search(self, query_embedding, top_k=5):
+
+        scores = []
+
+        for i, emb in enumerate(self.embeddings):
+
+            score = np.dot(
+                emb,
+                query_embedding
+            )
+
+            scores.append(
+                (i, float(score))
+            )
+
+        scores.sort(
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        return scores[:top_k]
+
+# ==========================================================
+# TEXT EMBEDDING
+# ==========================================================
+
+def text_to_embedding(text):
+
+    seed = abs(hash(text)) % (2**32)
+
+    rng = np.random.RandomState(seed)
+
+    vec = rng.normal(
+        size=(EMBEDDING_DIM,)
+    )
+
+    vec = vec.astype(np.float32)
+
+    vec /= np.linalg.norm(vec)
+
+    return vec
+
+# ==========================================================
+# INDEXING
+# ==========================================================
+
+def build_index(video_path):
+
+    print("Loading video...")
+
+    frames, frame_ids = extract_frames(
+        video_path
+    )
+
+    print(
+        f"Frames extracted: {len(frames)}"
+    )
+
+    store = VectorStore()
+
+    for i, frame in enumerate(frames):
+
+        emb = extract_embedding(frame)
+
+        meta = {
+            "frame_number":
+                frame_ids[i]
+        }
+
+        store.add(
+            emb,
+            meta
+        )
+
+        print(
+            f"Indexed {i+1}/{len(frames)}"
+        )
+
+    return store, frames
+
+# ==========================================================
+# SAVE INDEX
+# ==========================================================
+
+def save_index(
+    store,
+    filename="index.json"
+):
+
+    data = {
+
+        "embeddings": [
+            emb.tolist()
+            for emb in store.embeddings
+        ],
+
+        "metadata":
+            store.metadata
+    }
+
+    with open(
+        filename,
+        "w"
+    ) as f:
+
+        json.dump(
+            data,
+            f
+        )
+
+    print(
+        "Index saved."
+    )
+
+# ==========================================================
+# LOAD INDEX
+# ==========================================================
+
+def load_index(
+    filename="index.json"
+):
+
+    with open(
+        filename,
+        "r"
+    ) as f:
+
+        data = json.load(f)
+
+    store = VectorStore()
+
+    for emb, meta in zip(
+        data["embeddings"],
+        data["metadata"]
+    ):
+
+        store.add(
+            np.array(
+                emb,
+                dtype=np.float32
+            ),
+            meta
+        )
+
+    return store
+
+# ==========================================================
+# RETRIEVAL
+# ==========================================================
+
+def retrieve(
+    store,
+    query,
+    top_k=TOP_K
+):
+
+    q_emb = text_to_embedding(
+        query
+    )
+
+    results = store.search(
+        q_emb,
+        top_k
+    )
+
+    return results
+
+# ==========================================================
+# DISPLAY
+# ==========================================================
+
+def show_results(
+    frames,
+    store,
+    results
+):
+
+    for rank, (idx, score) in enumerate(results):
+
+        frame = frames[idx]
+
+        meta = store.metadata[idx]
+
+        frame_number = meta[
+            "frame_number"
+        ]
+
+        print()
+
+        print(
+            f"Rank: {rank+1}"
+        )
+
+        print(
+            f"Frame: {frame_number}"
+        )
+
+        print(
+            f"Score: {score:.4f}"
+        )
+
+        preview = cv2.resize(
+            frame,
+            (320, 240)
+        )
+
+        cv2.imshow(
+            f"Result {rank+1}",
+            preview
+        )
+
+    cv2.waitKey(0)
+
+    cv2.destroyAllWindows()
+
+# ==========================================================
+# ANALYZER
+# ==========================================================
+
+class VideoRAG:
+
+    def __init__(
+        self,
+        video_path
+    ):
+
+        self.video_path = video_path
+
+        self.store = None
+
+        self.frames = None
+
+    def index(self):
+
+        self.store, self.frames = build_index(
+            self.video_path
+        )
+
+    def query(
+        self,
+        text
+    ):
+
+        results = retrieve(
+            self.store,
+            text
+        )
+
+        show_results(
+            self.frames,
+            self.store,
+            results
+        )
+
+# ==========================================================
+# SIMPLE REPORT
+# ==========================================================
+
+def generate_report(
+    store
+):
+
+    total_frames = len(
+        store.metadata
+    )
+
+    report = []
+
+    report.append(
+        "VIDEO ANALYSIS REPORT"
+    )
+
+    report.append(
+        "=" * 40
+    )
+
+    report.append(
+        f"Indexed Frames: {total_frames}"
+    )
+
+    report.append(
+        f"Embedding Size: {EMBEDDING_DIM}"
+    )
+
+    report.append(
+        f"Database Entries: {len(store.embeddings)}"
+    )
+
+    report_text = "\n".join(
+        report
+    )
+
+    print(
+        report_text
+    )
+
+# ==========================================================
+# CLI
+# ==========================================================
+
+def interactive_loop(
+    rag
+):
+
+    while True:
+
+        print()
+
+        query = input(
+            "Ask about video (or exit): "
+        )
+
+        if query.lower() == "exit":
+
+            break
+
+        rag.query(
+            query
+        )
+
+# ==========================================================
+# MAIN
+# ==========================================================
+
+def main():
+
+    if len(sys.argv) < 2:
+
+        print(
+            "Usage:"
+        )
+
+        print(
+            "python video_rag.py video.mp4"
+        )
+
+        return
+
+    video_path = sys.argv[1]
+
+    if not os.path.exists(
+        video_path
+    ):
+
+        print(
+            "Video not found."
+        )
+
+        return
+
+    rag = VideoRAG(
+        video_path
+    )
+
+    rag.index()
+
+    generate_report(
+        rag.store
+    )
+
+    save_index(
+        rag.store
+    )
+
+    interactive_loop(
+        rag
+    )
+
+if __name__ == "__main__":
+
+    main()
